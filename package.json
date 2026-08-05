@@ -6,7 +6,7 @@
   "license": "AGPL-3.0-only",
   "scripts": {
     "test": "node --test",
-    "check": "node --check packages/protocol/index.js && node --check packages/worker-kit/index.js && node --check apps/node-worker/src/index.js && node --check apps/relay-worker/src/index.js && node --check apps/circle-worker/src/index.js && npm test"
+    "check": "find apps packages tests -name '*.js' -print0 | xargs -0 -n1 node --check && npm test"
   },
   "engines": { "node": ">=20" }
 }
