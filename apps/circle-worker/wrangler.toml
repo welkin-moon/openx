@@ -1,0 +1,13 @@
+name = "openx-circle"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+CIRCLE_DID = "did:web:circle.example.invalid"
+PUBLIC_BASE_URL = "https://circle.example.invalid"
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "replace-me"
+
+# Secret: CIRCLE_API_TOKEN
