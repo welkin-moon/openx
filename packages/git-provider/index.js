@@ -29,6 +29,18 @@ function equalBytes(left, right) {
   return true;
 }
 
+function normalizeEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) throw new Error("entries must be a non-empty array");
+  const normalized = entries.map((entry) => ({
+    path: normalizePath(entry.path),
+    bytes: asBytes(entry.bytes)
+  }));
+  if (new Set(normalized.map((entry) => entry.path)).size !== normalized.length) {
+    throw new Error("duplicate paths in atomic Git write");
+  }
+  return normalized;
+}
+
 function parseRetryAfter(headers, now = Date.now()) {
   const value = headers.get("retry-after");
   if (value) {
@@ -52,6 +64,17 @@ export class GitConflictError extends Error {
     this.name = "GitConflictError";
     this.code = "git_object_conflict";
     this.path = path;
+  }
+}
+
+export class GitControlVersionConflictError extends Error {
+  constructor(path, expectedBlob, actualBlob) {
+    super(`Git control object changed since it was read: ${path}`);
+    this.name = "GitControlVersionConflictError";
+    this.code = "git_control_version_conflict";
+    this.path = path;
+    this.expectedBlob = expectedBlob ?? null;
+    this.actualBlob = actualBlob ?? null;
   }
 }
 
@@ -92,7 +115,8 @@ export class GitProvider {
         "git.objects.read",
         "git.immutable-event-log",
         "git.atomic-tree-commit",
-        "git.concurrent-ref-retry"
+        "git.concurrent-ref-retry",
+        "git.control-plane-cas"
       ]
     };
   }
@@ -117,6 +141,10 @@ export class GitProvider {
 
   async putManyBytes() {
     throw new Error("GitProvider.putManyBytes is not implemented");
+  }
+
+  async putControlObjects() {
+    throw new Error("GitProvider.putControlObjects is not implemented");
   }
 }
 
@@ -205,7 +233,7 @@ export class GitHubProvider extends GitProvider {
       if (!existing[index]) pending.push(normalized[index]);
       else if (!equalBytes(existing[index].bytes, normalized[index].bytes)) throw new GitConflictError(normalized[index].path);
     }
-    return pending;
+    return { existing, pending };
   }
 
   async createAtomicCommit(pending, message, branch) {
@@ -246,25 +274,22 @@ export class GitHubProvider extends GitProvider {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ sha: commit.sha, force: false })
     });
-    return commit.sha;
+
+    return {
+      commit: commit.sha,
+      blobs: Object.fromEntries(pending.map((entry, index) => [entry.path, blobs[index].sha]))
+    };
   }
 
   async putManyBytes(entries, { message, branch = this.branch } = {}) {
-    if (!Array.isArray(entries) || entries.length === 0) throw new Error("entries must be a non-empty array");
-
-    const normalized = entries.map((entry) => ({
-      path: normalizePath(entry.path),
-      bytes: asBytes(entry.bytes)
-    }));
-    if (new Set(normalized.map((entry) => entry.path)).size !== normalized.length) {
-      throw new Error("duplicate paths in atomic Git write");
-    }
+    const normalized = normalizeEntries(entries);
 
     for (let attempt = 0; attempt <= this.maxRefRetries; attempt += 1) {
-      const pending = await this.inspectEntries(normalized, branch);
-      if (pending.length === 0) {
+      const inspection = await this.inspectEntries(normalized, branch);
+      if (inspection.pending.length === 0) {
         return {
           commit: null,
+          blobs: Object.fromEntries(normalized.map((entry, index) => [entry.path, inspection.existing[index].blob])),
           locations: normalized.map((entry) => this.objectRef(entry.path)),
           idempotent: true,
           refRetries: attempt
@@ -272,13 +297,19 @@ export class GitHubProvider extends GitProvider {
       }
 
       try {
-        const commit = await this.createAtomicCommit(
-          pending,
-          message || `openx: write ${pending.length} objects`,
+        const result = await this.createAtomicCommit(
+          inspection.pending,
+          message || `openx: write ${inspection.pending.length} objects`,
           branch
         );
         return {
-          commit,
+          commit: result.commit,
+          blobs: {
+            ...Object.fromEntries(normalized
+              .map((entry, index) => inspection.existing[index] ? [entry.path, inspection.existing[index].blob] : null)
+              .filter(Boolean)),
+            ...result.blobs
+          },
           locations: normalized.map((entry) => this.objectRef(entry.path)),
           idempotent: false,
           refRetries: attempt
@@ -290,6 +321,76 @@ export class GitHubProvider extends GitProvider {
       }
     }
     throw new Error("unreachable Git ref retry state");
+  }
+
+  async putControlObjects(entries, { expected, message, branch = this.branch } = {}) {
+    const normalized = normalizeEntries(entries);
+    const expectedPath = normalizePath(expected?.path || "");
+    if (!Object.prototype.hasOwnProperty.call(expected || {}, "blob")) {
+      throw new Error("control write requires expected.blob, including null for creation");
+    }
+    const expectedIndex = normalized.findIndex((entry) => entry.path === expectedPath);
+    if (expectedIndex < 0) throw new Error("control write set must contain the expected control object");
+
+    for (let attempt = 0; attempt <= this.maxRefRetries; attempt += 1) {
+      const existing = await Promise.all(normalized.map((entry) => this.getBytes(entry.path, { branch })));
+      const allSame = normalized.every((entry, index) => existing[index] && equalBytes(existing[index].bytes, entry.bytes));
+      if (allSame) {
+        return {
+          commit: null,
+          blobs: Object.fromEntries(normalized.map((entry, index) => [entry.path, existing[index].blob])),
+          locations: normalized.map((entry) => this.objectRef(entry.path)),
+          idempotent: true,
+          refRetries: attempt
+        };
+      }
+
+      const actualBlob = existing[expectedIndex]?.blob ?? null;
+      const expectedBlob = expected.blob ?? null;
+      if (actualBlob !== expectedBlob) {
+        throw new GitControlVersionConflictError(expectedPath, expectedBlob, actualBlob);
+      }
+
+      const pending = [];
+      for (let index = 0; index < normalized.length; index += 1) {
+        const entry = normalized[index];
+        const current = existing[index];
+        if (entry.path === expectedPath) {
+          if (!current || !equalBytes(current.bytes, entry.bytes)) pending.push(entry);
+        } else if (!current) {
+          pending.push(entry);
+        } else if (!equalBytes(current.bytes, entry.bytes)) {
+          throw new GitConflictError(entry.path);
+        }
+      }
+
+      try {
+        const result = await this.createAtomicCommit(
+          pending,
+          message || `openx: update control object ${expectedPath}`,
+          branch
+        );
+        return {
+          commit: result.commit,
+          blobs: {
+            ...Object.fromEntries(normalized
+              .map((entry, index) => existing[index] && !pending.some((item) => item.path === entry.path)
+                ? [entry.path, existing[index].blob]
+                : null)
+              .filter(Boolean)),
+            ...result.blobs
+          },
+          locations: normalized.map((entry) => this.objectRef(entry.path)),
+          idempotent: false,
+          refRetries: attempt
+        };
+      } catch (error) {
+        const refRace = error instanceof GitProviderHttpError && error.status === 422 && !error.rateLimited;
+        if (!refRace || attempt >= this.maxRefRetries) throw error;
+        await this.sleep(this.refRetryBaseMs * (2 ** attempt));
+      }
+    }
+    throw new Error("unreachable Git control ref retry state");
   }
 }
 
