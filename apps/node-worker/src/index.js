@@ -1,5 +1,10 @@
 import { manifests, relayRecord, sha256, verifyEvent } from "../../../packages/protocol/index.js";
-import { createGitProvider, GitConflictError, GitProviderHttpError } from "../../../packages/git-provider/index.js";
+import {
+  createGitProvider,
+  GitConflictError,
+  GitControlVersionConflictError,
+  GitProviderHttpError
+} from "../../../packages/git-provider/index.js";
 import {
   batchObjectPath,
   defaultStorageCatalog,
@@ -8,6 +13,9 @@ import {
 } from "../../../packages/storage-layout/index.js";
 import { catalogWriteSet, planSegmentRotation } from "../../../packages/storage-lifecycle/index.js";
 import { handle, HttpError, json, options, readJson, requireBearer } from "../../../packages/worker-kit/index.js";
+
+const decoder = new TextDecoder();
+const CATALOG_PATH = "openx/storage/catalog.json";
 
 function eventLocation(location, eventId, index = null) {
   return {
@@ -26,6 +34,9 @@ function storageError(error) {
   if (error instanceof GitConflictError || error?.code === "git_object_conflict") {
     return new HttpError(409, "immutable_object_conflict", error.message);
   }
+  if (error instanceof GitControlVersionConflictError || error?.code === "git_control_version_conflict") {
+    return new HttpError(409, "catalog_version_conflict", error.message);
+  }
   if (error instanceof GitProviderHttpError || error?.name === "GitProviderHttpError") {
     if (error.rateLimited) {
       return new HttpError(429, "git_rate_limited", error.message, retryAfterHeader(error.retryAfterMs));
@@ -35,6 +46,32 @@ function storageError(error) {
     return new HttpError(502, error.code || "git_provider_error", error.message);
   }
   return error;
+}
+
+async function loadStorageCatalog(provider, env) {
+  const stored = await provider.getBytes(CATALOG_PATH);
+  if (!stored) return { catalog: defaultStorageCatalog(env), blob: null, persisted: false };
+  try {
+    const catalog = JSON.parse(decoder.decode(stored.bytes));
+    if (catalog?.version !== "openx-storage-catalog/1") throw new Error("unsupported storage catalog version");
+    return { catalog, blob: stored.blob, persisted: true };
+  } catch (error) {
+    throw new HttpError(500, "storage_catalog_corrupt", error.message);
+  }
+}
+
+function buildRotationPlan(input, catalog) {
+  return planSegmentRotation({
+    catalog,
+    stats: input.stats,
+    policy: input.policy,
+    nextRepository: input.nextRepository,
+    nextRef: input.nextRef,
+    nextProvider: input.nextProvider,
+    nextObjectBase: input.nextObjectBase,
+    rootCommit: input.rootCommit,
+    packs: input.packs
+  }, input.now || new Date().toISOString());
 }
 
 function manifest(env, request) {
@@ -60,6 +97,7 @@ function manifest(env, request) {
       media: `${base}/openx/v1/media/{sha256}`,
       storageCatalog: `${base}/openx/v1/storage/catalog`,
       storageRotationPlan: `${base}/openx/v1/admin/storage/rotation/plan`,
+      storageRotationExecute: `${base}/openx/v1/admin/storage/rotation/execute`,
       manifest: `${base}/openx/v1/manifest`
     },
     clientCompatibility: {
@@ -178,31 +216,75 @@ async function putMedia(request, env, hash) {
   }
 }
 
+async function getCatalog(env) {
+  const provider = createGitProvider(env);
+  try {
+    const current = await loadStorageCatalog(provider, env);
+    return json({ ...current.catalog, storageVersion: current.blob, persisted: current.persisted });
+  } catch (error) {
+    throw storageError(error);
+  }
+}
+
 async function planRotation(request, env) {
   requireBearer(request, env.NODE_ADMIN_TOKEN || env.NODE_API_TOKEN);
   const input = await readJson(request, 1_000_000);
-  const catalog = input.catalog || defaultStorageCatalog(env);
-  const plan = planSegmentRotation({
-    catalog,
-    stats: input.stats,
-    policy: input.policy,
-    nextRepository: input.nextRepository,
-    nextRef: input.nextRef,
-    nextProvider: input.nextProvider,
-    nextObjectBase: input.nextObjectBase,
-    rootCommit: input.rootCommit,
-    packs: input.packs
-  }, input.now || new Date().toISOString());
+  const provider = createGitProvider(env);
+  try {
+    const current = await loadStorageCatalog(provider, env);
+    const plan = buildRotationPlan(input, current.catalog);
+    return json({
+      ok: true,
+      dryRun: true,
+      storageVersion: current.blob,
+      plan,
+      writeSet: catalogWriteSet(plan).map((entry) => ({
+        path: entry.path,
+        bytes: new TextEncoder().encode(entry.bytes).byteLength
+      }))
+    });
+  } catch (error) {
+    throw storageError(error);
+  }
+}
 
-  return json({
-    ok: true,
-    dryRun: true,
-    plan,
-    writeSet: catalogWriteSet(plan).map((entry) => ({
-      path: entry.path,
-      bytes: new TextEncoder().encode(entry.bytes).byteLength
-    }))
-  });
+async function executeRotation(request, env) {
+  requireBearer(request, env.NODE_ADMIN_TOKEN || env.NODE_API_TOKEN);
+  const input = await readJson(request, 1_000_000);
+  if (typeof input.confirmStorageVersion === "undefined") {
+    throw new HttpError(400, "missing_storage_version", "confirmStorageVersion is required; use null for an unpersisted catalog");
+  }
+
+  const provider = createGitProvider(env);
+  try {
+    const current = await loadStorageCatalog(provider, env);
+    if ((current.blob ?? null) !== (input.confirmStorageVersion ?? null)) {
+      throw new GitControlVersionConflictError(CATALOG_PATH, input.confirmStorageVersion ?? null, current.blob ?? null);
+    }
+
+    const plan = buildRotationPlan(input, current.catalog);
+    if (!plan.rotate) {
+      return json({ ok: true, rotated: false, storageVersion: current.blob, plan });
+    }
+
+    const writes = catalogWriteSet(plan);
+    const result = await provider.putControlObjects(writes, {
+      expected: { path: CATALOG_PATH, blob: current.blob },
+      message: `openx: rotate storage ${plan.sealedGeneration} to ${plan.activeGeneration}`
+    });
+
+    return json({
+      ok: true,
+      rotated: true,
+      commit: result.commit,
+      idempotent: result.idempotent,
+      refRetries: result.refRetries || 0,
+      storageVersion: result.blobs[CATALOG_PATH],
+      plan
+    }, { status: result.idempotent ? 200 : 201 });
+  } catch (error) {
+    throw storageError(error);
+  }
 }
 
 async function route(request, env) {
@@ -210,11 +292,12 @@ async function route(request, env) {
   const url = new URL(request.url);
   if (request.method === "GET" && url.pathname === "/healthz") return json({ ok: true, role: "user-node" });
   if (request.method === "GET" && url.pathname === "/openx/v1/manifest") return json(manifest(env, request));
-  if (request.method === "GET" && url.pathname === "/openx/v1/storage/catalog") {
-    return json(defaultStorageCatalog(env));
-  }
+  if (request.method === "GET" && url.pathname === "/openx/v1/storage/catalog") return getCatalog(env);
   if (request.method === "POST" && url.pathname === "/openx/v1/admin/storage/rotation/plan") {
     return planRotation(request, env);
+  }
+  if (request.method === "POST" && url.pathname === "/openx/v1/admin/storage/rotation/execute") {
+    return executeRotation(request, env);
   }
   if (request.method === "POST" && url.pathname === "/openx/v1/events") return createEvent(request, env);
   if (request.method === "POST" && url.pathname === "/openx/v1/events/batch") return createEventBatch(request, env);
