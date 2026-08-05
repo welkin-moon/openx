@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GitHubProvider, GitConflictError } from "../packages/git-provider/index.js";
+import { GitHubProvider, GitConflictError, GitProviderHttpError } from "../packages/git-provider/index.js";
 
-function response(status, body = null) {
+function response(status, body = null, headers = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
     status,
-    headers: body === null ? {} : { "content-type": "application/json" }
+    headers: body === null ? headers : { "content-type": "application/json", ...headers }
   });
 }
 
@@ -75,4 +75,68 @@ test("putManyBytes creates one tree and one commit for multiple objects", async 
   assert.equal(treeCall.body.base_tree, "base-tree");
   assert.equal(treeCall.body.tree.length, 2);
   assert.equal(calls.filter((call) => call.method === "POST" && call.path.endsWith("/git/commits")).length, 1);
+});
+
+test("putManyBytes retries a non-fast-forward ref race against the new parent", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let parentRead = 0;
+  let patchCount = 0;
+  const sleeps = [];
+
+  globalThis.fetch = async (url, init = {}) => {
+    const method = init.method || "GET";
+    const path = new URL(url).pathname;
+    if (method === "GET" && path.includes("/contents/")) return response(404, { message: "not found" });
+    if (method === "GET" && path.endsWith("/git/ref/heads/main")) {
+      parentRead += 1;
+      return response(200, { object: { sha: parentRead === 1 ? "parent-1" : "parent-2" } });
+    }
+    if (method === "GET" && path.endsWith("/git/commits/parent-1")) return response(200, { tree: { sha: "tree-1" } });
+    if (method === "GET" && path.endsWith("/git/commits/parent-2")) return response(200, { tree: { sha: "tree-2" } });
+    if (method === "POST" && path.endsWith("/git/blobs")) return response(201, { sha: "blob" });
+    if (method === "POST" && path.endsWith("/git/trees")) return response(201, { sha: parentRead === 1 ? "new-tree-1" : "new-tree-2" });
+    if (method === "POST" && path.endsWith("/git/commits")) return response(201, { sha: parentRead === 1 ? "commit-1" : "commit-2" });
+    if (method === "PATCH" && path.endsWith("/git/refs/heads/main")) {
+      patchCount += 1;
+      return patchCount === 1
+        ? response(422, { message: "Update is not a fast forward" })
+        : response(200, { object: { sha: "commit-2" } });
+    }
+    throw new Error(`unexpected request ${method} ${path}`);
+  };
+
+  const provider = new GitHubProvider({
+    owner: "alice",
+    repository: "data",
+    token: "test",
+    sleep: async (ms) => { sleeps.push(ms); }
+  });
+  const result = await provider.putManyBytes([{ path: "events/a.json", bytes: "data" }]);
+  assert.equal(result.commit, "commit-2");
+  assert.equal(result.refRetries, 1);
+  assert.deepEqual(sleeps, [100]);
+});
+
+test("GitHub rate-limit responses expose retry metadata and are not ref-race retried", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return response(429, { message: "secondary rate limit" }, { "retry-after": "30" });
+  };
+
+  const provider = new GitHubProvider({ owner: "alice", repository: "data", token: "test" });
+  await assert.rejects(
+    () => provider.putManyBytes([{ path: "events/a.json", bytes: "data" }]),
+    (error) => {
+      assert.ok(error instanceof GitProviderHttpError);
+      assert.equal(error.code, "git_rate_limited");
+      assert.equal(error.rateLimited, true);
+      assert.equal(error.retryAfterMs, 30_000);
+      return true;
+    }
+  );
+  assert.equal(calls, 1);
 });
