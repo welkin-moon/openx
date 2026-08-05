@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   acknowledge,
   markSending,
+  parseRetryAfter,
   planFlush,
   queuedEvent,
+  recoverSending,
   rejectOrRetry,
   retryDelay,
   shouldFlush
@@ -40,12 +42,39 @@ test("successful commit acknowledges only selected events", () => {
   assert.equal(entries[1].state, "queued");
 });
 
+test("expired sending lease returns event to queue after a crash", () => {
+  let entries = [queuedEvent(event("sha256:a"), 1)];
+  entries = markSending(entries, ["sha256:a"], 10);
+  const policy = { sendingLeaseMs: 60_000 };
+  assert.equal(recoverSending(entries, policy, 60_009)[0].state, "sending");
+  const recovered = recoverSending(entries, policy, 60_010)[0];
+  assert.equal(recovered.state, "queued");
+  assert.equal(recovered.lastError, "sending_lease_expired");
+});
+
 test("network and server errors retry with exponential delay", () => {
   let entries = [queuedEvent(event("sha256:a"), 1)];
   entries = markSending(entries, ["sha256:a"], 10);
   entries = rejectOrRetry(entries, ["sha256:a"], { status: 503, code: "unavailable" }, undefined, 20);
   assert.equal(entries[0].state, "queued");
   assert.equal(entries[0].nextAttemptAt, 20 + retryDelay(1));
+});
+
+test("Retry-After overrides exponential delay", () => {
+  let entries = [queuedEvent(event("sha256:a"), 1)];
+  entries = markSending(entries, ["sha256:a"], 10);
+  entries = rejectOrRetry(entries, ["sha256:a"], {
+    status: 429,
+    code: "rate_limited",
+    retryAfterMs: 30_000
+  }, undefined, 20);
+  assert.equal(entries[0].nextAttemptAt, 30_020);
+});
+
+test("Retry-After parses seconds and HTTP dates", () => {
+  assert.equal(parseRetryAfter("15", 1_000), 15_000);
+  assert.equal(parseRetryAfter("Thu, 01 Jan 1970 00:00:20 GMT", 5_000), 15_000);
+  assert.equal(parseRetryAfter("invalid", 5_000), null);
 });
 
 test("immutable conflicts are permanent rejections", () => {
