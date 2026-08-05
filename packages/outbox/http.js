@@ -13,6 +13,8 @@ export class OutboxHttpError extends Error {
     this.status = status;
     this.code = code;
     this.retryAfterMs = retryAfterMs;
+    this.eventIds = [];
+    this.acceptedEventIds = [];
   }
 }
 
@@ -44,27 +46,84 @@ export async function postEventBatch(endpoint, token, events, fetchImpl = fetch,
   return body;
 }
 
+export async function postEventBatchWithSplit(
+  endpoint,
+  token,
+  events,
+  fetchImpl = fetch,
+  now = Date.now()
+) {
+  try {
+    const result = await postEventBatch(endpoint, token, events, fetchImpl, now);
+    return {
+      eventIds: Array.isArray(result?.eventIds) ? result.eventIds : events.map((event) => event.id),
+      responses: [result]
+    };
+  } catch (error) {
+    if (error?.status !== 413 || events.length <= 1) {
+      error.eventIds = events.map((event) => event.id);
+      throw error;
+    }
+
+    const middle = Math.ceil(events.length / 2);
+    const leftEvents = events.slice(0, middle);
+    const rightEvents = events.slice(middle);
+    const left = await postEventBatchWithSplit(endpoint, token, leftEvents, fetchImpl, now);
+
+    try {
+      const right = await postEventBatchWithSplit(endpoint, token, rightEvents, fetchImpl, now);
+      return {
+        eventIds: [...left.eventIds, ...right.eventIds],
+        responses: [...left.responses, ...right.responses]
+      };
+    } catch (rightError) {
+      rightError.acceptedEventIds = [
+        ...(rightError.acceptedEventIds || []),
+        ...left.eventIds
+      ];
+      throw rightError;
+    }
+  }
+}
+
 export async function flushOutbox(entries, config, now = Date.now()) {
   const plan = planFlush(entries, config.policy, now);
   if (plan.events.length === 0) return { entries, result: null };
 
   const sending = markSending(entries, plan.eventIds, now);
   try {
-    const result = await postEventBatch(
+    const result = await postEventBatchWithSplit(
       config.endpoint,
       config.token,
       plan.events,
       config.fetchImpl || fetch,
       now
     );
-    const acknowledged = Array.isArray(result?.eventIds) ? result.eventIds : plan.eventIds;
+    const receipt = result.responses.length === 1
+      ? result.responses[0]
+      : { split: true, responses: result.responses };
     return {
-      entries: acknowledge(sending, acknowledged, result, now),
-      result
+      entries: acknowledge(sending, result.eventIds, receipt, now),
+      result: receipt
     };
   } catch (error) {
+    const accepted = new Set(error?.acceptedEventIds || []);
+    const failedIds = Array.isArray(error?.eventIds) && error.eventIds.length > 0
+      ? error.eventIds
+      : plan.eventIds.filter((eventId) => !accepted.has(eventId));
+    const partiallyAcknowledged = acknowledge(sending, [...accepted], {
+      split: true,
+      partial: true
+    }, now);
     return {
-      entries: rejectOrRetry(sending, plan.eventIds, error, config.policy, now),
+      entries: rejectOrRetry(
+        partiallyAcknowledged,
+        failedIds,
+        error,
+        config.policy,
+        now,
+        config.random || Math.random
+      ),
       error
     };
   }
