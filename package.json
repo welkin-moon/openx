@@ -1,0 +1,12 @@
+{
+  "name": "openx",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check packages/protocol/index.js && node --check packages/worker-kit/index.js && node --check apps/node-worker/src/index.js && node --check apps/relay-worker/src/index.js && node --check apps/circle-worker/src/index.js && npm test"
+  },
+  "engines": { "node": ">=20" }
+}
