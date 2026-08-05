@@ -1,11 +1,12 @@
 import { manifests, relayRecord, sha256, verifyEvent } from "../../../packages/protocol/index.js";
-import { createGitProvider, GitConflictError } from "../../../packages/git-provider/index.js";
+import { createGitProvider, GitConflictError, GitProviderHttpError } from "../../../packages/git-provider/index.js";
 import {
   batchObjectPath,
   defaultStorageCatalog,
   eventObjectPath,
   mediaObjectPath
 } from "../../../packages/storage-layout/index.js";
+import { catalogWriteSet, planSegmentRotation } from "../../../packages/storage-lifecycle/index.js";
 import { handle, HttpError, json, options, readJson, requireBearer } from "../../../packages/worker-kit/index.js";
 
 function eventLocation(location, eventId, index = null) {
@@ -16,9 +17,22 @@ function eventLocation(location, eventId, index = null) {
   };
 }
 
+function retryAfterHeader(milliseconds) {
+  if (!Number.isFinite(milliseconds)) return {};
+  return { "retry-after": String(Math.max(1, Math.ceil(milliseconds / 1_000))) };
+}
+
 function storageError(error) {
   if (error instanceof GitConflictError || error?.code === "git_object_conflict") {
     return new HttpError(409, "immutable_object_conflict", error.message);
+  }
+  if (error instanceof GitProviderHttpError || error?.name === "GitProviderHttpError") {
+    if (error.rateLimited) {
+      return new HttpError(429, "git_rate_limited", error.message, retryAfterHeader(error.retryAfterMs));
+    }
+    if (error.status === 401) return new HttpError(503, "git_authentication_failed", error.message);
+    if (error.status === 403) return new HttpError(503, "git_permission_denied", error.message);
+    return new HttpError(502, error.code || "git_provider_error", error.message);
   }
   return error;
 }
@@ -45,6 +59,7 @@ function manifest(env, request) {
       eventBatch: `${base}/openx/v1/events/batch`,
       media: `${base}/openx/v1/media/{sha256}`,
       storageCatalog: `${base}/openx/v1/storage/catalog`,
+      storageRotationPlan: `${base}/openx/v1/admin/storage/rotation/plan`,
       manifest: `${base}/openx/v1/manifest`
     },
     clientCompatibility: {
@@ -124,6 +139,7 @@ async function createEventBatch(request, env) {
       batch: `sha256:${digest}`,
       commit: result.commit,
       idempotent: result.idempotent,
+      refRetries: result.refRetries || 0,
       location: batchLocation,
       receipt: result.locations[1],
       eventIds: receipt.eventIds,
@@ -162,6 +178,33 @@ async function putMedia(request, env, hash) {
   }
 }
 
+async function planRotation(request, env) {
+  requireBearer(request, env.NODE_ADMIN_TOKEN || env.NODE_API_TOKEN);
+  const input = await readJson(request, 1_000_000);
+  const catalog = input.catalog || defaultStorageCatalog(env);
+  const plan = planSegmentRotation({
+    catalog,
+    stats: input.stats,
+    policy: input.policy,
+    nextRepository: input.nextRepository,
+    nextRef: input.nextRef,
+    nextProvider: input.nextProvider,
+    nextObjectBase: input.nextObjectBase,
+    rootCommit: input.rootCommit,
+    packs: input.packs
+  }, input.now || new Date().toISOString());
+
+  return json({
+    ok: true,
+    dryRun: true,
+    plan,
+    writeSet: catalogWriteSet(plan).map((entry) => ({
+      path: entry.path,
+      bytes: new TextEncoder().encode(entry.bytes).byteLength
+    }))
+  });
+}
+
 async function route(request, env) {
   if (request.method === "OPTIONS") return options();
   const url = new URL(request.url);
@@ -169,6 +212,9 @@ async function route(request, env) {
   if (request.method === "GET" && url.pathname === "/openx/v1/manifest") return json(manifest(env, request));
   if (request.method === "GET" && url.pathname === "/openx/v1/storage/catalog") {
     return json(defaultStorageCatalog(env));
+  }
+  if (request.method === "POST" && url.pathname === "/openx/v1/admin/storage/rotation/plan") {
+    return planRotation(request, env);
   }
   if (request.method === "POST" && url.pathname === "/openx/v1/events") return createEvent(request, env);
   if (request.method === "POST" && url.pathname === "/openx/v1/events/batch") return createEventBatch(request, env);
