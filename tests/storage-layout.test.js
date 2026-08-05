@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   batchObjectPath,
+  defaultStorageCatalog,
   eventObjectPath,
   mediaObjectPath,
   segmentCatalogEntry,
-  shouldSealSegment
+  shouldSealSegment,
+  storageCatalog
 } from "../packages/storage-layout/index.js";
 
 const hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -38,7 +40,7 @@ test("segment sealing reports every reached threshold", () => {
   assert.deepEqual(result, { seal: true, reasons: ["age", "size", "objects", "commits"] });
 });
 
-test("segment catalog is provider-neutral", () => {
+test("segment catalog entry is provider-neutral", () => {
   assert.deepEqual(segmentCatalogEntry({
     generation: 4,
     repository: "alice/openx-data-0004",
@@ -50,11 +52,38 @@ test("segment catalog is provider-neutral", () => {
     state: "active",
     repository: "alice/openx-data-0004",
     ref: "main",
+    provider: "github",
     createdAt: "2026-08-05T00:00:00Z",
     sealedAt: null,
     rootCommit: null,
+    objectBase: "",
     packs: [],
     objectCount: 0,
     reachableBytes: 0
   });
+});
+
+test("storage catalog requires one active segment", () => {
+  assert.throws(() => storageCatalog({
+    actor: "did:key:alice",
+    updatedAt: "2026-08-05T00:00:00Z",
+    segments: []
+  }), /exactly one active segment/u);
+});
+
+test("default catalog describes the configured Git repository", () => {
+  const catalog = defaultStorageCatalog({
+    NODE_DID: "did:key:alice",
+    GIT_PROVIDER: "github",
+    GIT_OWNER: "alice",
+    GIT_REPOSITORY: "openx-data-0001",
+    GIT_BRANCH: "journal",
+    STORAGE_GENERATION: "0001",
+    STORAGE_CREATED_AT: "2026-08-05T00:00:00Z"
+  }, "2026-08-05T01:00:00Z");
+
+  assert.equal(catalog.version, "openx-storage-catalog/1");
+  assert.equal(catalog.activeGeneration, "0001");
+  assert.equal(catalog.segments[0].repository, "alice/openx-data-0001");
+  assert.equal(catalog.segments[0].ref, "journal");
 });
