@@ -1,10 +1,7 @@
 import { manifests, relayRecord, sha256, verifyEvent } from "../../../packages/protocol/index.js";
 import { createGitProvider } from "../../../packages/git-provider/index.js";
+import { batchObjectPath, eventObjectPath, mediaObjectPath } from "../../../packages/storage-layout/index.js";
 import { handle, HttpError, json, options, readJson, requireBearer } from "../../../packages/worker-kit/index.js";
-
-function dayBucket(createdAt) {
-  return /^\d{4}-\d{2}-\d{2}/u.exec(String(createdAt))?.[0] || "undated";
-}
 
 function eventLocation(location, eventId, index = null) {
   return {
@@ -26,8 +23,9 @@ function manifest(env, request) {
     storage,
     writeModel: {
       durableBuffer: false,
-      canonicalLog: "git-immutable-objects",
-      discussionWorkspace: false
+      canonicalLog: "segmented-git-objects",
+      discussionWorkspace: false,
+      cloneRequired: false
     },
     endpoints: {
       events: `${base}/openx/v1/events`,
@@ -50,7 +48,7 @@ async function createEvent(request, env) {
   await verifyEvent(event);
 
   const provider = createGitProvider(env);
-  const path = `events/inbox/${dayBucket(event.createdAt)}/${event.id.slice(7)}.json`;
+  const path = eventObjectPath(event.id, event.createdAt);
   const result = await provider.putBytes(path, `${JSON.stringify(event)}\n`, {
     message: `openx: append ${event.kind}`
   });
@@ -83,7 +81,7 @@ async function createEventBatch(request, env) {
   const ndjson = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
   const digest = await sha256(ndjson);
   const provider = createGitProvider(env);
-  const path = `events/inbox/${dayBucket(events[0].createdAt)}/batch-${digest}.ndjson`;
+  const path = batchObjectPath(digest, events[0].createdAt);
   const result = await provider.putBytes(path, ndjson, {
     message: `openx: append ${events.length} events`
   });
@@ -113,7 +111,7 @@ async function putMedia(request, env, hash) {
   if (digest !== hash) throw new HttpError(422, "hash_mismatch", "media hash mismatch");
 
   const provider = createGitProvider(env);
-  const path = `media/${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.bin`;
+  const path = mediaObjectPath(hash);
   const result = await provider.putBytes(path, bytes, { message: `openx: store media ${hash}` });
   return json({ ok: true, hash, commit: result.commit, location: result.location }, { status: 201 });
 }
