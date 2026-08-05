@@ -1,0 +1,15 @@
+name = "openx-node"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+NODE_DID = "did:web:example.invalid"
+GITHUB_OWNER = "replace-me"
+GITHUB_REPO = "openx"
+GITHUB_BRANCH = "main"
+PUBLIC_BASE_URL = "https://example.invalid"
+MAX_MEDIA_CHUNK_BYTES = "8388608"
+
+# Secrets:
+# NODE_API_TOKEN
+# GITHUB_TOKEN
