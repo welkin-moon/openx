@@ -1,5 +1,5 @@
 import { manifests, relayRecord, sha256, verifyEvent } from "../../../packages/protocol/index.js";
-import { createGitProvider } from "../../../packages/git-provider/index.js";
+import { createGitProvider, GitConflictError } from "../../../packages/git-provider/index.js";
 import { batchObjectPath, eventObjectPath, mediaObjectPath } from "../../../packages/storage-layout/index.js";
 import { handle, HttpError, json, options, readJson, requireBearer } from "../../../packages/worker-kit/index.js";
 
@@ -9,6 +9,13 @@ function eventLocation(location, eventId, index = null) {
     eventId,
     ...(index === null ? {} : { ndjsonIndex: index })
   };
+}
+
+function storageError(error) {
+  if (error instanceof GitConflictError || error?.code === "git_object_conflict") {
+    return new HttpError(409, "immutable_object_conflict", error.message);
+  }
+  return error;
 }
 
 function manifest(env, request) {
@@ -23,9 +30,10 @@ function manifest(env, request) {
     storage,
     writeModel: {
       durableBuffer: false,
-      canonicalLog: "segmented-git-objects",
+      canonicalLog: "git-immutable-objects",
       discussionWorkspace: false,
-      cloneRequired: false
+      idempotency: "content-addressed-path",
+      batchAtomicity: "single-git-tree-commit"
     },
     endpoints: {
       events: `${base}/openx/v1/events`,
@@ -48,19 +56,23 @@ async function createEvent(request, env) {
   await verifyEvent(event);
 
   const provider = createGitProvider(env);
-  const path = eventObjectPath(event.id, event.createdAt);
-  const result = await provider.putBytes(path, `${JSON.stringify(event)}\n`, {
-    message: `openx: append ${event.kind}`
-  });
-  const source = eventLocation(result.location, event.id);
+  try {
+    const result = await provider.putBytes(eventObjectPath(event.id, event.createdAt), `${JSON.stringify(event)}\n`, {
+      message: `openx: append ${event.kind}`
+    });
+    const source = eventLocation(result.location, event.id);
 
-  return json({
-    ok: true,
-    eventId: event.id,
-    commit: result.commit,
-    location: source,
-    relayRecord: relayRecord(event, source)
-  }, { status: 201 });
+    return json({
+      ok: true,
+      eventId: event.id,
+      commit: result.commit,
+      idempotent: result.idempotent,
+      location: source,
+      relayRecord: relayRecord(event, source)
+    }, { status: result.idempotent ? 200 : 201 });
+  } catch (error) {
+    throw storageError(error);
+  }
 }
 
 async function createEventBatch(request, env) {
@@ -80,23 +92,41 @@ async function createEventBatch(request, env) {
 
   const ndjson = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
   const digest = await sha256(ndjson);
-  const provider = createGitProvider(env);
-  const path = batchObjectPath(digest, events[0].createdAt);
-  const result = await provider.putBytes(path, ndjson, {
-    message: `openx: append ${events.length} events`
-  });
-
-  return json({
-    ok: true,
-    count: events.length,
+  const dataPath = batchObjectPath(digest, events[0].createdAt);
+  const receiptPath = `receipts/batches/${digest.slice(0, 2)}/${digest.slice(2, 4)}/${digest}.json`;
+  const receipt = {
+    version: "openx-batch-receipt/1",
     batch: `sha256:${digest}`,
-    commit: result.commit,
-    location: result.location,
+    count: events.length,
     eventIds: events.map((event) => event.id),
-    relayRecords: events
-      .map((event, index) => relayRecord(event, eventLocation(result.location, event.id, index)))
-      .filter(Boolean)
-  }, { status: 201 });
+    object: dataPath,
+    createdAt: events[0].createdAt
+  };
+
+  const provider = createGitProvider(env);
+  try {
+    const result = await provider.putManyBytes([
+      { path: dataPath, bytes: ndjson },
+      { path: receiptPath, bytes: `${JSON.stringify(receipt)}\n` }
+    ], { message: `openx: append ${events.length} events` });
+
+    const batchLocation = result.locations[0];
+    return json({
+      ok: true,
+      count: events.length,
+      batch: `sha256:${digest}`,
+      commit: result.commit,
+      idempotent: result.idempotent,
+      location: batchLocation,
+      receipt: result.locations[1],
+      eventIds: receipt.eventIds,
+      relayRecords: events
+        .map((event, index) => relayRecord(event, eventLocation(batchLocation, event.id, index)))
+        .filter(Boolean)
+    }, { status: result.idempotent ? 200 : 201 });
+  } catch (error) {
+    throw storageError(error);
+  }
 }
 
 async function putMedia(request, env, hash) {
@@ -111,9 +141,18 @@ async function putMedia(request, env, hash) {
   if (digest !== hash) throw new HttpError(422, "hash_mismatch", "media hash mismatch");
 
   const provider = createGitProvider(env);
-  const path = mediaObjectPath(hash);
-  const result = await provider.putBytes(path, bytes, { message: `openx: store media ${hash}` });
-  return json({ ok: true, hash, commit: result.commit, location: result.location }, { status: 201 });
+  try {
+    const result = await provider.putBytes(mediaObjectPath(hash), bytes, { message: `openx: store media ${hash}` });
+    return json({
+      ok: true,
+      hash,
+      commit: result.commit,
+      idempotent: result.idempotent,
+      location: result.location
+    }, { status: result.idempotent ? 200 : 201 });
+  } catch (error) {
+    throw storageError(error);
+  }
 }
 
 async function route(request, env) {
