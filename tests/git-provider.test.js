@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GitHubProvider, GitConflictError, GitProviderHttpError } from "../packages/git-provider/index.js";
+import {
+  GitHubProvider,
+  GitConflictError,
+  GitControlVersionConflictError,
+  GitProviderHttpError
+} from "../packages/git-provider/index.js";
 
 function response(status, body = null, headers = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -139,4 +144,74 @@ test("GitHub rate-limit responses expose retry metadata and are not ref-race ret
     }
   );
   assert.equal(calls, 1);
+});
+
+test("putControlObjects atomically updates a versioned catalog and immutable history", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const calls = [];
+  let blobNumber = 0;
+
+  globalThis.fetch = async (url, init = {}) => {
+    const method = init.method || "GET";
+    const path = new URL(url).pathname;
+    calls.push({ method, path, body: init.body ? JSON.parse(init.body) : null });
+
+    if (method === "GET" && path.includes("/contents/openx/storage/catalog.json")) {
+      return response(200, { type: "file", encoding: "base64", content: btoa("old-catalog"), sha: "catalog-v1" });
+    }
+    if (method === "GET" && path.includes("/contents/openx/storage/history/")) return response(404, { message: "not found" });
+    if (method === "GET" && path.endsWith("/git/ref/heads/main")) return response(200, { object: { sha: "parent" } });
+    if (method === "GET" && path.endsWith("/git/commits/parent")) return response(200, { tree: { sha: "base-tree" } });
+    if (method === "POST" && path.endsWith("/git/blobs")) return response(201, { sha: `blob-${++blobNumber}` });
+    if (method === "POST" && path.endsWith("/git/trees")) return response(201, { sha: "tree-next" });
+    if (method === "POST" && path.endsWith("/git/commits")) return response(201, { sha: "commit-next" });
+    if (method === "PATCH" && path.endsWith("/git/refs/heads/main")) return response(200, { object: { sha: "commit-next" } });
+    throw new Error(`unexpected request ${method} ${path}`);
+  };
+
+  const provider = new GitHubProvider({ owner: "alice", repository: "data", token: "test" });
+  const result = await provider.putControlObjects([
+    { path: "openx/storage/catalog.json", bytes: "new-catalog" },
+    { path: "openx/storage/history/2026.json", bytes: "new-catalog" }
+  ], {
+    expected: { path: "openx/storage/catalog.json", blob: "catalog-v1" }
+  });
+
+  assert.equal(result.commit, "commit-next");
+  assert.equal(result.idempotent, false);
+  const tree = calls.find((call) => call.method === "POST" && call.path.endsWith("/git/trees"));
+  assert.equal(tree.body.tree.length, 2);
+});
+
+test("putControlObjects rejects a stale expected catalog version before creating a commit", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let writes = 0;
+
+  globalThis.fetch = async (url, init = {}) => {
+    const method = init.method || "GET";
+    const path = new URL(url).pathname;
+    if (method === "GET" && path.includes("/contents/openx/storage/catalog.json")) {
+      return response(200, { type: "file", encoding: "base64", content: btoa("other-catalog"), sha: "catalog-v2" });
+    }
+    if (method === "GET" && path.includes("/contents/openx/storage/history/")) return response(404, { message: "not found" });
+    writes += 1;
+    throw new Error(`unexpected write ${method} ${path}`);
+  };
+
+  const provider = new GitHubProvider({ owner: "alice", repository: "data", token: "test" });
+  await assert.rejects(
+    () => provider.putControlObjects([
+      { path: "openx/storage/catalog.json", bytes: "new-catalog" },
+      { path: "openx/storage/history/2026.json", bytes: "new-catalog" }
+    ], { expected: { path: "openx/storage/catalog.json", blob: "catalog-v1" } }),
+    (error) => {
+      assert.ok(error instanceof GitControlVersionConflictError);
+      assert.equal(error.expectedBlob, "catalog-v1");
+      assert.equal(error.actualBlob, "catalog-v2");
+      return true;
+    }
+  );
+  assert.equal(writes, 0);
 });
