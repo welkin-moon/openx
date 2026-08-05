@@ -64,11 +64,46 @@ export function segmentCatalogEntry(input) {
     state: input.state || "active",
     repository: input.repository,
     ref: input.ref,
+    provider: input.provider || "github",
     createdAt: input.createdAt,
     sealedAt: input.sealedAt || null,
     rootCommit: input.rootCommit || null,
+    objectBase: input.objectBase || "",
     packs: input.packs || [],
     objectCount: Number(input.objectCount || 0),
     reachableBytes: Number(input.reachableBytes || 0)
   };
+}
+
+export function storageCatalog(input) {
+  const segments = (input?.segments || []).map(segmentCatalogEntry);
+  const active = segments.filter((segment) => segment.state === "active");
+  if (active.length !== 1) throw new Error("storage catalog requires exactly one active segment");
+  return {
+    version: "openx-storage-catalog/1",
+    actor: input.actor,
+    updatedAt: input.updatedAt,
+    activeGeneration: active[0].generation,
+    segments
+  };
+}
+
+export function defaultStorageCatalog(env, now = new Date().toISOString()) {
+  const owner = env.GIT_OWNER || env.GITHUB_OWNER;
+  const repository = env.GIT_REPOSITORY || env.GITHUB_REPO;
+  const ref = env.GIT_BRANCH || env.GITHUB_BRANCH || "main";
+  if (!owner || !repository) throw new Error("Git storage repository is not configured");
+  return storageCatalog({
+    actor: env.NODE_DID,
+    updatedAt: now,
+    segments: [{
+      generation: env.STORAGE_GENERATION || "0001",
+      state: "active",
+      provider: env.GIT_PROVIDER || "github",
+      repository: `${owner}/${repository}`,
+      ref,
+      createdAt: env.STORAGE_CREATED_AT || now,
+      objectBase: env.STORAGE_OBJECT_BASE || ""
+    }]
+  });
 }
