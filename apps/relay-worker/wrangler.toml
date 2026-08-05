@@ -1,0 +1,13 @@
+name = "openx-relay"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+RELAY_DID = "did:web:relay.example.invalid"
+PUBLIC_BASE_URL = "https://relay.example.invalid"
+
+[[kv_namespaces]]
+binding = "INDEX"
+id = "replace-me"
+
+# Secret: RELAY_API_TOKEN
