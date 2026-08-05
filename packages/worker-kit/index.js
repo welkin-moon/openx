@@ -1,8 +1,9 @@
 export class HttpError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, headers = {}) {
     super(message);
     this.status = status;
     this.code = code;
+    this.headers = headers;
   }
 }
 
@@ -38,6 +39,9 @@ export async function handle(request, fn) {
   try { return await fn(); }
   catch (error) {
     console.error(error);
-    return json({ error: error.code ?? "internal_error", message: error.message ?? "internal error" }, { status: error.status ?? 500 });
+    return json(
+      { error: error.code ?? "internal_error", message: error.message ?? "internal error" },
+      { status: error.status ?? 500, headers: error.headers }
+    );
   }
 }
