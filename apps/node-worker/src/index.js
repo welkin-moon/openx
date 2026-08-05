@@ -1,6 +1,11 @@
 import { manifests, relayRecord, sha256, verifyEvent } from "../../../packages/protocol/index.js";
 import { createGitProvider, GitConflictError } from "../../../packages/git-provider/index.js";
-import { batchObjectPath, eventObjectPath, mediaObjectPath } from "../../../packages/storage-layout/index.js";
+import {
+  batchObjectPath,
+  defaultStorageCatalog,
+  eventObjectPath,
+  mediaObjectPath
+} from "../../../packages/storage-layout/index.js";
 import { handle, HttpError, json, options, readJson, requireBearer } from "../../../packages/worker-kit/index.js";
 
 function eventLocation(location, eventId, index = null) {
@@ -39,13 +44,15 @@ function manifest(env, request) {
       events: `${base}/openx/v1/events`,
       eventBatch: `${base}/openx/v1/events/batch`,
       media: `${base}/openx/v1/media/{sha256}`,
+      storageCatalog: `${base}/openx/v1/storage/catalog`,
       manifest: `${base}/openx/v1/manifest`
     },
     clientCompatibility: {
       event: "openx-event/1",
       signatures: ["Ed25519"],
       payloads: ["ciphertext", "public-metadata"],
-      retryOwnership: "client"
+      retryOwnership: "client",
+      storageCatalog: "openx-storage-catalog/1"
     }
   };
 }
@@ -160,6 +167,9 @@ async function route(request, env) {
   const url = new URL(request.url);
   if (request.method === "GET" && url.pathname === "/healthz") return json({ ok: true, role: "user-node" });
   if (request.method === "GET" && url.pathname === "/openx/v1/manifest") return json(manifest(env, request));
+  if (request.method === "GET" && url.pathname === "/openx/v1/storage/catalog") {
+    return json(defaultStorageCatalog(env));
+  }
   if (request.method === "POST" && url.pathname === "/openx/v1/events") return createEvent(request, env);
   if (request.method === "POST" && url.pathname === "/openx/v1/events/batch") return createEventBatch(request, env);
   const media = url.pathname.match(/^\/openx\/v1\/media\/([a-f0-9]{64})$/u);
