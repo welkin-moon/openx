@@ -32,7 +32,11 @@ export class GitProvider {
       provider: this.provider,
       repository: `${this.owner}/${this.repository}`,
       ref: this.branch,
-      capabilities: ["git.contents.write", "git.objects.read"]
+      capabilities: [
+        "git.contents.write",
+        "git.objects.read",
+        "git.immutable-event-log"
+      ]
     };
   }
 
@@ -62,12 +66,7 @@ export class GitHubProvider extends GitProvider {
   descriptor() {
     return {
       ...super.descriptor(),
-      apiBase: this.apiBase,
-      capabilities: [
-        "git.contents.write",
-        "git.objects.read",
-        "workspace.github-discussions"
-      ]
+      apiBase: this.apiBase
     };
   }
 
@@ -77,7 +76,7 @@ export class GitHubProvider extends GitProvider {
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${this.token}`,
-        "x-github-api-version": "2026-03-10",
+        "x-github-api-version": "2022-11-28",
         "user-agent": "openx-node/0.0.1",
         ...(init.headers || {})
       }
