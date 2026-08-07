@@ -1,0 +1,19 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "openx-relay",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-31",
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": true },
+  "vars": {
+    "RUNTIME_KIND": "cloudflare-worker",
+    "RELAY_STORE": "cloudflare-kv"
+  },
+  "kv_namespaces": [
+    { "binding": "INDEX" }
+  ],
+  "secrets": {
+    "required": ["RELAY_DID", "RELAY_API_TOKEN"]
+  }
+}
