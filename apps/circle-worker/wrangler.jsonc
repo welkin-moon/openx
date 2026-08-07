@@ -1,0 +1,15 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "openx-circle",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-31",
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": true },
+  "kv_namespaces": [
+    { "binding": "STATE" }
+  ],
+  "secrets": {
+    "required": ["CIRCLE_DID", "CIRCLE_API_TOKEN"]
+  }
+}
