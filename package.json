@@ -6,7 +6,16 @@
   "license": "AGPL-3.0-only",
   "scripts": {
     "test": "node --test",
-    "check": "find apps packages tests -name '*.js' -print0 | xargs -0 -n1 node --check && npm test"
+    "check": "find apps packages tests -name '*.js' -print0 | xargs -0 -n1 node --check && npm test",
+    "cf:dev:node": "wrangler dev --config apps/node-worker/wrangler.jsonc",
+    "cf:dev:relay": "wrangler dev --config apps/relay-worker/wrangler.jsonc",
+    "cf:dev:circle": "wrangler dev --config apps/circle-worker/wrangler.jsonc",
+    "cf:upload:node": "wrangler versions upload --config apps/node-worker/wrangler.jsonc",
+    "cf:upload:relay": "wrangler versions upload --config apps/relay-worker/wrangler.jsonc",
+    "cf:upload:circle": "wrangler versions upload --config apps/circle-worker/wrangler.jsonc"
   },
-  "engines": { "node": ">=20" }
+  "engines": { "node": ">=20" },
+  "devDependencies": {
+    "wrangler": "^4.102.0"
+  }
 }
