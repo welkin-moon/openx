@@ -1,0 +1,28 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "openx-node",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-31",
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": true },
+  "vars": {
+    "GIT_PROVIDER": "github",
+    "GIT_BRANCH": "main",
+    "GIT_MAX_REF_RETRIES": "3",
+    "GIT_REF_RETRY_BASE_MS": "100",
+    "MAX_EVENT_BATCH_SIZE": "100",
+    "MAX_EVENT_BATCH_BYTES": "4000000",
+    "MAX_MEDIA_CHUNK_BYTES": "8388608"
+  },
+  "secrets": {
+    "required": [
+      "NODE_DID",
+      "NODE_API_TOKEN",
+      "NODE_ADMIN_TOKEN",
+      "GIT_OWNER",
+      "GIT_REPOSITORY",
+      "GIT_TOKEN"
+    ]
+  }
+}
